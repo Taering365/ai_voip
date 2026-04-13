@@ -1,0 +1,27 @@
+[project]
+name = "ai-voip-backend"
+version = "0.1.0"
+description = "开源智能外呼平台后端服务与 PostgreSQL DDL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.42.88",
+    "cryptography>=46.0.6",
+    "fastapi>=0.135.2",
+    "httpx>=0.28.1",
+    "psycopg[binary]>=3.2,<3.3",
+    "pydantic-settings>=2.13.1",
+    "pyjwt>=2.12.1",
+    "python-multipart>=0.0.26",
+    "usip",
+    "uvicorn[standard]>=0.42.0",
+    "websockets>=15.0.1",
+]
+
+[project.scripts]
+ai-voip-backend = "ai_voip_backend.cli:main"
+ai-voip-api = "ai_voip_backend.server:main"
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
