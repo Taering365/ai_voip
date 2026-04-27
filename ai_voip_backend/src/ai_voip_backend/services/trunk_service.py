@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import socket
 import ssl
@@ -14,6 +15,8 @@ from psycopg.types.json import Jsonb
 
 from ..api.schemas.trunk import TrunkCreateRequest, TrunkStatusUpdateRequest, TrunkUpdateRequest
 from .common import soft_delete_by_id
+
+logger = logging.getLogger("ai_voip.trunk")
 
 
 def list_trunks(connection: Connection, user_id: int | None = None, is_admin: bool = False) -> list[dict]:
@@ -568,28 +571,49 @@ def probe_trunk(connection: Connection, trunk_id: int) -> dict | None:
     if trunk_item is None:
         return None
 
+    # 统一提取线路基础信息，后续检测与日志都使用同一份上下文，避免打印内容不一致。
     host = trunk_item["server_host"]
     port = trunk_item["server_port"]
+    transport = trunk_item["transport"]
     start_time = time.perf_counter()
+    logger.info(
+        "开始线路检测 trunk_id=%s trunk_code=%s trunk_name=%s trunk_type=%s target=%s:%s transport=%s",
+        trunk_item["id"],
+        trunk_item["trunk_code"],
+        trunk_item["trunk_name"],
+        trunk_item["trunk_type"],
+        host,
+        port,
+        transport,
+    )
     if trunk_item["trunk_type"] == "gateway":
         connect_status, register_status, message = _probe_gateway_endpoint(
             host,
             port,
-            trunk_item["transport"],
+            transport,
             trunk_item["caller_id_number"] or "gateway",
         )
     else:
+        # SIP 账号线路优先复用项目内真实 uSIP 注册栈，避免手写探测报文与生产实际行为不一致。
+        sip_password = get_trunk_password_by_id(connection, trunk_id) or ""
         connect_status, register_status, message = _probe_sip_register(
-            host,
-            port,
-            trunk_item["transport"],
-            trunk_item["username"] or "",
-            get_trunk_password_by_id(connection, trunk_id) or "",
-            trunk_item["full_name"] or trunk_item["username"] or "",
+            trunk_item,
+            sip_password,
         )
 
+    # 使用统一耗时统计结果，方便把页面弹窗与日志中的时间对齐。
     latency_ms = int((time.perf_counter() - start_time) * 1000)
     probe_status = "success" if register_status == "success" else ("warning" if connect_status == "success" else "failed")
+    logger.info(
+        "线路检测完成 trunk_id=%s trunk_code=%s connect_status=%s register_status=%s probe_status=%s latency_ms=%s message=%s",
+        trunk_item["id"],
+        trunk_item["trunk_code"],
+        connect_status,
+        register_status,
+        probe_status,
+        latency_ms,
+        message,
+    )
     return {
         "trunk_id": trunk_item["id"],
         "trunk_code": trunk_item["trunk_code"],
@@ -597,7 +621,7 @@ def probe_trunk(connection: Connection, trunk_id: int) -> dict | None:
         "trunk_type": trunk_item["trunk_type"],
         "host": host,
         "port": port,
-        "transport": trunk_item["transport"],
+        "transport": transport,
         "connect_status": connect_status,
         "register_status": register_status,
         "probe_status": probe_status,
@@ -654,6 +678,7 @@ def _probe_gateway_endpoint(host: str, port: int, transport: str, caller_id_numb
     """
 
     try:
+        # 先发送真实 OPTIONS 报文，再根据返回状态码判断网关可达性。
         response_text = _send_sip_request(
             host,
             port,
@@ -661,6 +686,14 @@ def _probe_gateway_endpoint(host: str, port: int, transport: str, caller_id_numb
             _build_options_request(host, port, transport, caller_id_number),
         )
         status_code = _parse_sip_status_code(response_text)
+        logger.info(
+            "网关线路检测收到响应 target=%s:%s transport=%s status_code=%s response_line=%s",
+            host,
+            port,
+            transport,
+            status_code,
+            response_text.splitlines()[0] if response_text.splitlines() else "EMPTY",
+        )
         if status_code is None:
             return "failed", "not_applicable", "网关未返回有效的 SIP 响应"
         return (
@@ -669,42 +702,93 @@ def _probe_gateway_endpoint(host: str, port: int, transport: str, caller_id_numb
             f"网关返回 SIP {status_code}，可判定线路可达",
         )
     except OSError as exc:
+        logger.error(
+            "网关线路检测失败 target=%s:%s transport=%s error=%s",
+            host,
+            port,
+            transport,
+            exc,
+            exc_info=True,
+        )
         return "failed", "not_applicable", f"网关探测失败：{exc}"
 
 
-def _probe_sip_register(
-    host: str,
-    port: int,
-    transport: str,
-    username: str,
-    password: str,
-    full_name: str,
-) -> tuple[str, str, str]:
+def _probe_sip_register(trunk_item: dict, password: str) -> tuple[str, str, str]:
     """对 SIP 账号线路执行 REGISTER 挑战应答检测。
 
     Args:
-        host: 需要注册检测的目标主机地址。
-        port: 需要注册检测的目标端口。
-        transport: 当前线路使用的传输协议。
-        username: SIP 用户名。
+        trunk_item: 当前待检测的 SIP 线路配置字典。
         password: SIP 密码。
-        full_name: SIP Full Name。
 
     Returns:
         tuple[str, str, str]: 返回连通状态、注册状态和说明文本。
     """
 
+    # 统一从线路字典中提取关键信息，避免调用方和当前函数分别维护一套参数。
+    host = str(trunk_item.get("server_host") or "")
+    port = int(trunk_item.get("server_port") or 5060)
+    transport = str(trunk_item.get("transport") or "udp")
+    username = str(trunk_item.get("username") or "")
+    full_name = str(trunk_item.get("full_name") or trunk_item.get("username") or "")
+    # SIP 注册必须同时具备用户名、密码和显示名称，否则无法构造完整 REGISTER 报文。
     if not username or not password or not full_name:
+        logger.warning(
+            "SIP 注册检测前置信息不完整 target=%s:%s transport=%s username_present=%s password_present=%s full_name_present=%s",
+            host,
+            port,
+            transport,
+            bool(username),
+            bool(password),
+            bool(full_name),
+        )
         return "failed", "failed", "当前线路缺少 Username、Password 或 Full Name，无法执行真实注册检测"
 
     try:
+        # 当前项目已经集成了真实可用的 uSIP 注册栈，检测时优先复用它，结果会比手写 REGISTER 更接近生产实际。
+        usip_probe_result = _probe_sip_register_with_usip(trunk_item, password)
+        if usip_probe_result is not None:
+            return usip_probe_result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "uSIP 检测线路失败，回退到手写 REGISTER 探测 target=%s:%s transport=%s username=%s error=%s",
+            host,
+            port,
+            transport,
+            username,
+            exc,
+            exc_info=True,
+        )
+
+    try:
+        # 首次与二次 REGISTER 必须尽量保持同一事务上下文，避免服务端因会话标识变化拒绝鉴权重放。
+        register_request_context = _build_register_request_context(host)
+        # 首次 REGISTER 不带鉴权头，目的是拿到服务端下发的 Digest Challenge。
         first_response = _send_sip_request(
             host,
             port,
             transport,
-            _build_register_request(host, port, transport, username, full_name),
+            _build_register_request(
+                host,
+                port,
+                transport,
+                username,
+                full_name,
+                call_id=register_request_context["call_id"],
+                local_tag=register_request_context["local_tag"],
+                cseq=register_request_context["cseq"],
+                request_uri=register_request_context["request_uri"],
+            ),
         )
         first_status_code = _parse_sip_status_code(first_response)
+        logger.info(
+            "SIP 注册首次响应 target=%s:%s transport=%s username=%s status_code=%s response_line=%s",
+            host,
+            port,
+            transport,
+            username,
+            first_status_code,
+            first_response.splitlines()[0] if first_response.splitlines() else "EMPTY",
+        )
         if first_status_code == 200:
             return "success", "success", f"已向 {host}:{port} 发起 REGISTER，请求直接返回 200，线路已可用"
         if first_status_code not in {401, 407}:
@@ -713,7 +797,19 @@ def _probe_sip_register(
         digest_challenge = _extract_digest_challenge(first_response)
         if digest_challenge is None:
             return "failed", "failed", "服务端返回了鉴权挑战，但未解析到 Digest 参数"
+        logger.info(
+            "SIP 注册鉴权挑战解析完成 target=%s:%s transport=%s username=%s realm=%s algorithm=%s qop=%s opaque_present=%s",
+            host,
+            port,
+            transport,
+            username,
+            digest_challenge.get("realm", ""),
+            digest_challenge.get("algorithm", "MD5"),
+            digest_challenge.get("qop", ""),
+            bool(digest_challenge.get("opaque")),
+        )
 
+        # 二次 REGISTER 带上 Digest 鉴权头，用于验证账号密码与服务端 challenge 是否匹配。
         second_response = _send_sip_request(
             host,
             port,
@@ -724,21 +820,149 @@ def _probe_sip_register(
                 transport,
                 username,
                 full_name,
+                call_id=register_request_context["call_id"],
+                local_tag=register_request_context["local_tag"],
+                cseq=register_request_context["cseq"] + 1,
+                request_uri=register_request_context["request_uri"],
                 authorization_header=_build_digest_authorization(
                     username,
                     password,
-                    host,
+                    register_request_context["request_uri"],
                     digest_challenge,
                     header_name="Proxy-Authorization" if first_status_code == 407 else "Authorization",
                 ),
             ),
         )
         second_status_code = _parse_sip_status_code(second_response)
+        logger.info(
+            "SIP 注册二次响应 target=%s:%s transport=%s username=%s status_code=%s response_line=%s",
+            host,
+            port,
+            transport,
+            username,
+            second_status_code,
+            second_response.splitlines()[0] if second_response.splitlines() else "EMPTY",
+        )
         if second_status_code == 200:
             return "success", "success", f"REGISTER 鉴权成功，服务端返回 200，线路 {host}:{port} 可正常使用"
         return "success", "failed", f"REGISTER 已到达服务端，但鉴权失败，服务端返回 {second_status_code or '无有效响应'}"
     except OSError as exc:
+        logger.error(
+            "SIP 注册检测失败 target=%s:%s transport=%s username=%s error=%s",
+            host,
+            port,
+            transport,
+            username,
+            exc,
+            exc_info=True,
+        )
         return "failed", "failed", f"SIP REGISTER 探测失败：{exc}"
+
+
+def _probe_sip_register_with_usip(trunk_item: dict, password: str) -> tuple[str, str, str] | None:
+    """使用项目内真实 uSIP 客户端执行 SIP 注册检测。
+
+    Args:
+        trunk_item: 当前待检测的 SIP 线路配置字典。
+        password: SIP 密码明文。
+
+    Returns:
+        tuple[str, str, str] | None: 成功执行检测时返回状态元组；当前环境缺少 uSIP 时返回 None 交给上层回退。
+    """
+
+    from .sip_usip_service import build_usip_account, import_usip_runtime, normalize_usip_state_value
+
+    host = str(trunk_item.get("server_host") or "")
+    port = int(trunk_item.get("server_port") or 5060)
+    transport = str(trunk_item.get("transport") or "udp")
+    username = str(trunk_item.get("username") or "")
+    runtime_objects = import_usip_runtime()
+    account = build_usip_account(runtime_objects, trunk_item, password)
+    client_class = runtime_objects["SIPClient"]
+    client = client_class(account)
+    last_state = "UNKNOWN"
+    start_success = False
+    register_sent = False
+    try:
+        # 先启动客户端监听，再发 REGISTER，整个过程与正式外呼前注册保持同一链路。
+        start_success = bool(client.start())
+        if not start_success:
+            logger.warning(
+                "uSIP 线路检测启动失败 target=%s:%s transport=%s username=%s",
+                host,
+                port,
+                transport,
+                username,
+            )
+            return "failed", "failed", "uSIP 客户端启动失败，无法执行真实注册检测"
+        register_sent = bool(client.register())
+        if not register_sent:
+            logger.warning(
+                "uSIP 线路检测发送 REGISTER 失败 target=%s:%s transport=%s username=%s",
+                host,
+                port,
+                transport,
+                username,
+            )
+            return "failed", "failed", "uSIP REGISTER 发送失败，请检查线路配置和本地网络"
+
+        # 等待注册状态稳定到最终值，避免仅收到 401 挑战时就过早结束检测。
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            last_state = normalize_usip_state_value(getattr(client, "registration_state", None))
+            if last_state in {"REGISTERED", "FAILED", "UNREGISTERED"}:
+                break
+            time.sleep(0.3)
+        logger.info(
+            "uSIP 线路检测完成 target=%s:%s transport=%s username=%s start_success=%s register_sent=%s final_state=%s",
+            host,
+            port,
+            transport,
+            username,
+            start_success,
+            register_sent,
+            last_state,
+        )
+        if last_state == "REGISTERED":
+            return "success", "success", f"uSIP REGISTER 鉴权成功，线路 {host}:{port} 可正常使用"
+        if last_state == "FAILED":
+            return "success", "failed", "uSIP REGISTER 已到达服务端，但注册状态失败，请继续检查服务端鉴权策略"
+        if last_state == "UNREGISTERED":
+            return "failed", "failed", "uSIP 注册状态异常结束，当前线路未保持注册成功状态"
+        return "failed", "failed", f"uSIP 注册超时，当前状态为 {last_state}"
+    finally:
+        # 无论成功失败都及时关闭探测客户端，避免线路检测残留额外注册会话或后台线程。
+        try:
+            client.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "uSIP 线路检测停止客户端失败 target=%s:%s transport=%s username=%s error=%s",
+                host,
+                port,
+                transport,
+                username,
+                exc,
+                exc_info=True,
+            )
+
+
+def _build_register_request_context(host: str) -> dict[str, str | int]:
+    """构造一次 REGISTER 检测共用的事务上下文。
+
+    Args:
+        host: 当前注册目标主机地址，用于生成唯一 Call-ID。
+
+    Returns:
+        dict[str, str | int]: 返回 REGISTER 请求需要复用的 Call-ID、tag、CSeq 与 Request-URI。
+    """
+
+    # 检测接口的二次鉴权必须沿用同一组事务标识，才能最大程度模拟真实 SIP 客户端行为。
+    return {
+        "call_id": f"{uuid.uuid4().hex}@{host}",
+        "local_tag": uuid.uuid4().hex[:10],
+        "cseq": 1,
+        "request_uri": f"sip:{host}",
+    }
 
 
 def _build_options_request(host: str, port: int, transport: str, caller_id_number: str) -> str:
@@ -777,6 +1001,10 @@ def _build_register_request(
     transport: str,
     username: str,
     full_name: str,
+    call_id: str,
+    local_tag: str,
+    cseq: int,
+    request_uri: str,
     authorization_header: str | None = None,
 ) -> str:
     """构造 SIP REGISTER 报文。
@@ -787,22 +1015,24 @@ def _build_register_request(
         transport: 传输协议。
         username: SIP 用户名。
         full_name: SIP Full Name。
+        call_id: 当前 REGISTER 事务使用的 Call-ID。
+        local_tag: 当前 REGISTER 事务使用的 From tag。
+        cseq: 当前 REGISTER 事务使用的 CSeq 序号。
+        request_uri: 当前 REGISTER 请求行使用的目标 URI。
         authorization_header: 二次 REGISTER 时附带的鉴权头文本。
 
     Returns:
         str: 返回完整的 SIP REGISTER 报文文本。
     """
-
+    # branch 每次都应重新生成，而 Call-ID / tag / CSeq 需要由外层统一控制，以便重放鉴权时保持事务连续性。
     branch = f"z9hG4bK{uuid.uuid4().hex[:16]}"
-    call_id = f"{uuid.uuid4().hex}@{host}"
-    local_tag = uuid.uuid4().hex[:10]
     lines = [
-        f"REGISTER sip:{host}:{port} SIP/2.0",
+        f"REGISTER {request_uri} SIP/2.0",
         f"Via: SIP/2.0/{transport.upper()} 127.0.0.1:5062;branch={branch};rport",
         f'From: "{full_name}" <sip:{username}@{host}>;tag={local_tag}',
         f"To: <sip:{username}@{host}>",
         f"Call-ID: {call_id}",
-        "CSeq: 1 REGISTER",
+        f"CSeq: {cseq} REGISTER",
         f"Contact: <sip:{username}@127.0.0.1:5062>",
         "Max-Forwards: 70",
         "Expires: 60",
@@ -817,7 +1047,7 @@ def _build_register_request(
 def _build_digest_authorization(
     username: str,
     password: str,
-    host: str,
+    request_uri: str,
     digest_challenge: dict[str, str],
     header_name: str,
 ) -> str:
@@ -826,7 +1056,7 @@ def _build_digest_authorization(
     Args:
         username: SIP 用户名。
         password: SIP 密码。
-        host: 注册目标主机地址。
+        request_uri: 当前 REGISTER 请求行使用的目标 URI，用于保持 Digest URI 与请求一致。
         digest_challenge: 从响应头中解析出来的 Digest 参数字典。
         header_name: 输出时使用的头名称，可能是 Authorization 或 Proxy-Authorization。
 
@@ -838,23 +1068,31 @@ def _build_digest_authorization(
     nonce = digest_challenge.get("nonce", "")
     algorithm = digest_challenge.get("algorithm", "MD5")
     qop = digest_challenge.get("qop", "")
-    uri = f"sip:{host}:{digest_challenge.get('port', '')}".rstrip(":")
+    opaque = digest_challenge.get("opaque", "")
+    # Digest URI 必须与 REGISTER 请求目标保持一致，避免服务端因 URI 不匹配而持续返回 401。
+    uri = request_uri
     ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode("utf-8")).hexdigest()
     ha2 = hashlib.md5(f"REGISTER:{uri}".encode("utf-8")).hexdigest()
     cnonce = uuid.uuid4().hex[:16]
     nc_value = "00000001"
     if "auth" in qop:
         response = hashlib.md5(f"{ha1}:{nonce}:{nc_value}:{cnonce}:auth:{ha2}".encode("utf-8")).hexdigest()
-        return (
+        authorization_text = (
             f'{header_name}: Digest username="{username}", realm="{realm}", nonce="{nonce}", '
             f'uri="{uri}", response="{response}", algorithm={algorithm}, qop=auth, '
             f'nc={nc_value}, cnonce="{cnonce}"'
         )
+        if opaque:
+            authorization_text += f', opaque="{opaque}"'
+        return authorization_text
     response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode("utf-8")).hexdigest()
-    return (
+    authorization_text = (
         f'{header_name}: Digest username="{username}", realm="{realm}", nonce="{nonce}", '
         f'uri="{uri}", response="{response}", algorithm={algorithm}'
     )
+    if opaque:
+        authorization_text += f', opaque="{opaque}"'
+    return authorization_text
 
 
 def _send_sip_request(host: str, port: int, transport: str, request_text: str) -> str:

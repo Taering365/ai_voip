@@ -487,8 +487,9 @@ async function probeTrunk(row) {
   probingId.value = row.id
   try {
     const result = await probeTrunkApi(row.id)
+    // 注册状态要结合后端说明文本一起判断，避免把鉴权失败误显示成“前置信息不完整”。
     const connectStatusText = resolveProbeStatusText(result.connect_status, '连通')
-    const registerStatusText = resolveProbeStatusText(result.register_status, '注册')
+    const registerStatusText = resolveProbeStatusText(result.register_status, '注册', result.message)
     const lines = [
       `线路：${result.trunk_name}`,
       `类型：${result.trunk_type === 'gateway' ? '网关对接' : 'SIP账号'}`,
@@ -529,9 +530,10 @@ async function removeTrunk(row) {
  *
  * @param {string} status 原始状态值。
  * @param {string} scene 当前展示场景，用于细化文案。
+ * @param {string} message 后端返回的说明文本，用于区分鉴权失败和前置信息缺失。
  * @returns {string} 返回中文说明文本。
  */
-function resolveProbeStatusText(status, scene) {
+function resolveProbeStatusText(status, scene, message = '') {
   if (status === 'success') {
     return scene === '注册' ? '基础信息完整，可继续做注册验证' : '连通正常'
   }
@@ -542,6 +544,10 @@ function resolveProbeStatusText(status, scene) {
     return '当前线路类型无需注册'
   }
   if (status === 'failed') {
+    // 只要后端明确说明是 401/407 或鉴权失败，就按真实注册失败展示，避免误导排查方向。
+    if (scene === '注册' && /鉴权失败|401|407/i.test(message)) {
+      return '注册鉴权失败'
+    }
     return scene === '注册' ? '注册前置信息不完整' : '连通失败'
   }
   return status || '--'
