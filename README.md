@@ -142,6 +142,32 @@ npm run dev
 npm run build
 ```
 
+## 日志与排查
+
+后端启动时会自动初始化日志目录，默认写入 `ai_voip_backend/log`：
+
+- `info.log`：接口访问、任务调度、关键业务操作等普通日志
+- `error.log`：未处理异常、接口调用失败、健康检查失败等错误日志
+
+常用排查命令：
+
+```bash
+cd ai_voip_backend
+uv run ai-voip-backend show-log --type error --lines 100
+uv run ai-voip-backend show-log --type info --lines 100
+```
+
+日志文件采用滚动写入，每个文件默认 10MB，最多保留 10 个历史文件。
+
+### 本地流式 ASR 排查
+
+如果在“语音接口”页面检测本地流式 ASR 时出现连接失败，或任务启动后没有自动外呼，请先确认：
+
+- 本地流式 ASR 服务已经启动，并提供 `/start`、`/chunk`、`/finish` 三个接口。
+- `endpoint` 是后端服务器能访问的地址；如果 ASR 服务不在后端同机，不能填写 `127.0.0.1`，需要填写后端可访问的实际 IP。
+- 在后端机器上执行 `curl http://<ASR_HOST>:<PORT>/api/asr/stream/start` 或对应健康检查命令确认端口可达。
+- 查看 `error.log` 中的 `本地流式 ASR 健康检查连接失败`、`实时 ASR 会话启动失败` 关键字，确认失败的 endpoint 和异常类型。
+
 ## 数据与存储
 
 - 数据库统一使用 `PostgreSQL`

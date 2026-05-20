@@ -1031,9 +1031,16 @@ class SipUsipExecutor:
         try:
             asyncio.run(self._run_realtime_asr_session_async(provider_item, await_reply_config, tracker))
         except Exception as exc:  # noqa: BLE001
+            config_json = provider_item.get("config_json") or {}
             tracker.error_message = f"实时 ASR 会话启动失败：{exc!r}"
             tracker.completed_event.set()
-            self.logger.warning("ASR 诊断: 实时 ASR 会话启动失败 detail=%r", exc)
+            self.logger.warning(
+                "ASR 诊断: 实时 ASR 会话启动失败 provider_id=%s driver=%s endpoint=%s detail=%r",
+                provider_item.get("id"),
+                provider_item.get("driver_name"),
+                config_json.get("endpoint"),
+                exc,
+            )
 
     async def _run_realtime_asr_session_async(
         self,

@@ -18,4 +18,15 @@ uv run ai-voip-backend show-db-config
 uv run ai-voip-backend check-db
 uv run ai-voip-backend apply-sql
 uv run ai-voip-backend bootstrap-admin --username admin --password '<PASSWORD>'
+uv run ai-voip-backend show-log --type error --lines 100
+uv run ai-voip-backend show-log --type info --lines 100
 ```
+
+## 日志说明
+
+后端日志默认写入当前目录下的 `log` 文件夹：
+
+- `log/info.log`：记录请求访问、任务调度、健康检查等关键操作。
+- `log/error.log`：记录异常堆栈、第三方接口调用失败、本地 ASR 连接失败等错误。
+
+如果本地流式 ASR 检测失败，请优先查看 `error.log` 中的 endpoint 与异常详情。`127.0.0.1` 表示后端服务器本机，如果 ASR 服务部署在另一台机器，需要在语音接口配置里填写后端可访问的实际地址。

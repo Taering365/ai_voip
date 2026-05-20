@@ -339,7 +339,7 @@ function resolveTemplateAlertText() {
     return 'TTS 默认模板：MiniMax WebSocket 接口'
   }
   if (formState.driver_name === 'qwen_stream_asr_http') {
-    return 'ASR 默认模板：本地流式 ASR 接口，适合低延迟场景，可按自己的本地服务地址修改'
+    return 'ASR 默认模板：本地流式 ASR 接口；接口地址以后端服务器访问视角为准，ASR 不在同机时不要填写 127.0.0.1'
   }
   return 'ASR 默认模板：阿里百炼实时 WebSocket 接口'
 }

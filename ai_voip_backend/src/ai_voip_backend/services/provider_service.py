@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import ssl
 import uuid
 from copy import deepcopy
@@ -17,6 +18,9 @@ from websockets.asyncio.client import connect as websocket_connect
 from ..errors import AppError
 from ..api.schemas.provider import SpeechProviderCreateRequest, SpeechProviderUpdateRequest
 from .common import jsonb_value, soft_delete_by_id
+
+
+logger = logging.getLogger("ai_voip.provider")
 
 
 DEFAULT_PROVIDER_DEFINITIONS = [
@@ -564,33 +568,87 @@ async def run_qwen_stream_asr_health_check(provider_item: dict) -> dict:
 
     config_json = provider_item.get("config_json") or {}
     endpoint = build_qwen_stream_asr_base_url(config_json)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        start_response = await client.post(
-            f"{endpoint}/start",
-            json=build_qwen_stream_start_payload(config_json),
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            start_response = await client.post(
+                f"{endpoint}/start",
+                json=build_qwen_stream_start_payload(config_json),
+            )
+            start_response.raise_for_status()
+            start_data = start_response.json()
+            session_id = str((start_data.get("data") or {}).get("session_id") or "").strip()
+            if start_data.get("code") != 200 or not session_id:
+                raise AppError("asr_health_check_failed", f"本地流式 ASR 检测失败，start 返回异常：{start_data}")
+            finish_response = await client.post(
+                f"{endpoint}/finish",
+                json={"session_id": session_id},
+            )
+            finish_response.raise_for_status()
+            finish_data = finish_response.json()
+            if finish_data.get("code") != 200:
+                raise AppError("asr_health_check_failed", f"本地流式 ASR 检测失败，finish 返回异常：{finish_data}")
+            return {
+                "ok": True,
+                "provider_id": provider_item["id"],
+                "provider_type": provider_item["provider_type"],
+                "driver_name": provider_item["driver_name"],
+                "endpoint": endpoint,
+                "message": "本地流式 ASR 接口连接成功",
+                "server_event": "http_start_finish_ok",
+            }
+    except AppError:
+        raise
+    except httpx.ConnectError as exc:
+        # 连接失败通常表示本地 ASR 服务未启动、端口不通或 endpoint 写成了错误机器的 127.0.0.1。
+        logger.error(
+            "本地流式 ASR 健康检查连接失败: provider_id=%s driver=%s endpoint=%s detail=%r",
+            provider_item.get("id"),
+            provider_item.get("driver_name"),
+            endpoint,
+            exc,
+            exc_info=True,
         )
-        start_response.raise_for_status()
-        start_data = start_response.json()
-        session_id = str((start_data.get("data") or {}).get("session_id") or "").strip()
-        if start_data.get("code") != 200 or not session_id:
-            raise AppError("asr_health_check_failed", f"本地流式 ASR 检测失败，start 返回异常：{start_data}")
-        finish_response = await client.post(
-            f"{endpoint}/finish",
-            json={"session_id": session_id},
+        raise AppError(
+            "asr_health_check_failed",
+            f"本地流式 ASR 服务连接失败：{endpoint}，请检查服务是否启动、端口是否开放，以及 endpoint 是否为后端服务器可访问地址。",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        # 超时单独提示，便于运维区分网络不可达和服务响应过慢。
+        logger.error(
+            "本地流式 ASR 健康检查超时: provider_id=%s driver=%s endpoint=%s detail=%r",
+            provider_item.get("id"),
+            provider_item.get("driver_name"),
+            endpoint,
+            exc,
+            exc_info=True,
         )
-        finish_response.raise_for_status()
-        finish_data = finish_response.json()
-        if finish_data.get("code") != 200:
-            raise AppError("asr_health_check_failed", f"本地流式 ASR 检测失败，finish 返回异常：{finish_data}")
-        return {
-            "ok": True,
-            "provider_id": provider_item["id"],
-            "provider_type": provider_item["provider_type"],
-            "driver_name": provider_item["driver_name"],
-            "endpoint": endpoint,
-            "message": "本地流式 ASR 接口连接成功",
-            "server_event": "http_start_finish_ok",
-        }
+        raise AppError("asr_health_check_failed", f"本地流式 ASR 服务响应超时：{endpoint}，请检查服务负载和网络连通性。") from exc
+    except httpx.HTTPStatusError as exc:
+        # HTTP 状态异常说明服务有响应但协议或路径不符合预期。
+        logger.error(
+            "本地流式 ASR 健康检查 HTTP 状态异常: provider_id=%s driver=%s endpoint=%s status=%s detail=%r",
+            provider_item.get("id"),
+            provider_item.get("driver_name"),
+            endpoint,
+            exc.response.status_code if exc.response else "-",
+            exc,
+            exc_info=True,
+        )
+        raise AppError(
+            "asr_health_check_failed",
+            f"本地流式 ASR 服务返回异常状态：{exc.response.status_code if exc.response else 'unknown'}，请检查 endpoint 路径是否正确。",
+        ) from exc
+    except (ValueError, TypeError) as exc:
+        # 返回体不是约定 JSON 时，转换成业务错误，避免前端只看到服务器 500。
+        logger.error(
+            "本地流式 ASR 健康检查返回体异常: provider_id=%s driver=%s endpoint=%s detail=%r",
+            provider_item.get("id"),
+            provider_item.get("driver_name"),
+            endpoint,
+            exc,
+            exc_info=True,
+        )
+        raise AppError("asr_health_check_failed", f"本地流式 ASR 返回体无法解析，请检查服务协议是否兼容：{endpoint}") from exc
 
 
 async def run_minimax_tts_health_check(provider_item: dict) -> dict:

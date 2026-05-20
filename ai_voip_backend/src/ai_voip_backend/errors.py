@@ -10,8 +10,6 @@ from fastapi.responses import JSONResponse
 from psycopg.errors import CheckViolation, ForeignKeyViolation, IntegrityError, NotNullViolation, UniqueViolation
 from starlette import status
 
-from .api.schemas.common import ApiErrorResponse
-
 
 logger = logging.getLogger("ai_voip.error")
 
@@ -68,13 +66,15 @@ def build_error_response(
         JSONResponse: 返回标准化 JSON 错误响应对象。
     """
 
+    # 错误模块不能导入 API 路由包，避免单独导入 AppError 时触发路由与服务层循环依赖。
     response = JSONResponse(
         status_code=status_code,
-        content=ApiErrorResponse(
-            message=message,
-            error_code=error_code,
-            data=data,
-        ).model_dump(),
+        content={
+            "success": False,
+            "message": message,
+            "error_code": error_code,
+            "data": data,
+        },
     )
     response.headers["X-Error-Code"] = error_code
     return response

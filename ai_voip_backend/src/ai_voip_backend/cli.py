@@ -11,6 +11,12 @@ from .db import check_db_connection, describe_config, execute_sql_file
 from .schema import build_schema_bundle, get_sql_files
 
 
+SUPPORTED_LOG_TYPES = {
+    "info": "info.log",
+    "error": "error.log",
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。
 
@@ -45,6 +51,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("show-db-config", help="显示当前 PostgreSQL 配置。")
     subparsers.add_parser("check-db", help="检查当前 PostgreSQL 连通性。")
+
+    log_parser = subparsers.add_parser("show-log", help="查看后端日志尾部内容。")
+    log_parser.add_argument(
+        "--type",
+        choices=sorted(SUPPORTED_LOG_TYPES),
+        default="error",
+        help="日志类型，info 表示普通操作日志，error 表示异常日志。",
+    )
+    log_parser.add_argument(
+        "--lines",
+        type=int,
+        default=100,
+        help="输出最近多少行日志，默认 100 行。",
+    )
 
     apply_parser = subparsers.add_parser("apply-sql", help="执行 PostgreSQL 初始化 SQL。")
     apply_parser.add_argument(
@@ -164,6 +184,41 @@ def handle_check_db(project_root: Path) -> int:
     return 0
 
 
+def handle_show_log_tail(
+    project_root: Path,
+    log_type: str,
+    line_count: int,
+    printer=print,
+) -> int:
+    """输出指定日志文件的尾部内容。
+
+    Args:
+        project_root: 当前后端项目根目录。
+        log_type: 日志类型，只允许 info 或 error。
+        line_count: 需要输出的最近日志行数。
+        printer: 输出函数，默认直接打印到标准输出。
+
+    Returns:
+        int: 命令执行完成后的退出码，0 表示成功。
+    """
+
+    if log_type not in SUPPORTED_LOG_TYPES:
+        raise ValueError(f"不支持的日志类型: {log_type}")
+
+    # 限制最大读取行数，避免一次性输出过多日志影响终端和自动化脚本。
+    normalized_line_count = min(max(int(line_count or 100), 1), 1000)
+    log_path = project_root / "log" / SUPPORTED_LOG_TYPES[log_type]
+    if not log_path.exists():
+        printer(f"日志文件不存在: {log_path}")
+        return 0
+
+    # 日志文件按 UTF-8 写入，读取失败时替换坏字符，保证排查命令不中断。
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-normalized_line_count:]:
+        printer(line)
+    return 0
+
+
 def handle_apply_sql(project_root: Path, sql_file: str | None) -> int:
     """执行初始化 SQL 文件到 PostgreSQL。
 
@@ -228,6 +283,8 @@ def main() -> int:
         return handle_show_db_config(project_root)
     if args.command == "check-db":
         return handle_check_db(project_root)
+    if args.command == "show-log":
+        return handle_show_log_tail(project_root, args.type, args.lines)
     if args.command == "apply-sql":
         return handle_apply_sql(project_root, args.sql_file)
     if args.command == "bootstrap-admin":

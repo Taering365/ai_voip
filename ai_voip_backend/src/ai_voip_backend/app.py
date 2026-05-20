@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from psycopg.errors import IntegrityError
 
-from .api import api_router
+from .api.router import api_router
 from .api.dependencies import get_project_root
 from .errors import (
     AppError,
